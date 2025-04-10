@@ -1,0 +1,271 @@
+#!/bin/sh
+
+# Detect OS
+OS=$(uname -s)
+
+# Check if terminal supports colors
+if [ -t 1 ] && [ -n "$TERM" ] && [ "$TERM" != "dumb" ]; then
+    RED=$(printf "\033[31m")
+    GREEN=$(printf "\033[32m")
+    YELLOW=$(printf "\033[33m")
+    BLUE=$(printf "\033[34m")
+    RESET=$(printf "\033[0m")
+else
+    RED=""
+    GREEN=""
+    YELLOW=""
+    BLUE=""
+    RESET=""
+fi
+
+get_battery_color() {
+    local PERCENTAGE=$1
+    if [ "$PERCENTAGE" -le 10 ]; then
+        printf "%s" "$RED"
+    elif [ "$PERCENTAGE" -le 25 ]; then
+        printf "%s" "$YELLOW"
+    else
+        printf "%s" "$GREEN"
+    fi
+}
+
+format_progress_bar() {
+    local PERCENTAGE=$1
+    local WIDTH=20
+    
+    # Ensure percentage doesn't exceed 100
+    if [ "$PERCENTAGE" -gt 100 ]; then
+        PERCENTAGE=100
+    fi
+    
+    local FILLED=$(( $PERCENTAGE * $WIDTH / 100 ))
+    local EMPTY=$(( $WIDTH - $FILLED ))
+    local COLOR=$(get_battery_color "$PERCENTAGE")
+    
+    printf "["
+    printf "%s" "$COLOR"
+    for i in $(seq 1 $FILLED); do printf "#"; done
+    printf "%s" "$RESET"
+    if [ "$EMPTY" -gt 0 ]; then
+        for i in $(seq 1 $EMPTY); do printf "-"; done
+    fi
+    printf "]"
+}
+
+format_time() {
+    local MINUTES=$1
+    
+    if [ "$MINUTES" -eq 0 ]; then
+        echo "--:--"
+        return
+    fi
+    
+    local HOURS=$(( MINUTES / 60 ))
+    local MINS=$(( MINUTES % 60 ))
+    printf "%02d:%02d" "$HOURS" "$MINS"
+}
+
+get_macos_battery_info() {
+    # Get raw battery data
+    local DATA=$(pmset -g batt)
+    if ! echo "$DATA" | grep -q "InternalBattery"; then
+        echo "No battery found"
+        exit 1
+    fi
+
+    # Extract battery percentage
+    local CAPACITY=$(echo "$DATA" | grep -o '[0-9]*%' | tr -d '%')
+    
+    # Extract charging status
+    local RAW_STATUS=$(echo "$DATA" | grep -o ".*;" | tr -d ';' | awk '{print $NF}')
+    local STATUS
+    case "$RAW_STATUS" in
+        "charging") STATUS="Charging" ;;
+        "discharging") STATUS="Discharging" ;;
+        "charged") STATUS="Full" ;;
+        "AC attached") STATUS="Full" ;;
+        *) STATUS="Unknown" ;;
+    esac
+    
+    # Extract time remaining
+    local TIME_REMAINING=0
+    if [ "$STATUS" != "Full" ]; then
+        local TIME_STR=$(echo "$DATA" | grep -o '[0-9]*:[0-9]* remaining' | awk '{print $1}' || echo "0:0")
+        if [ -n "$TIME_STR" ]; then
+            local HOURS=$(echo "$TIME_STR" | cut -d: -f1)
+            local MINS=$(echo "$TIME_STR" | cut -d: -f2)
+            TIME_REMAINING=$(( ${HOURS:-0} * 60 + ${MINS:-0} ))
+        fi
+    fi
+    
+    # Format status symbol with color
+    local STATUS_SYMBOL
+    local STATUS_COLOR
+    case "$STATUS" in
+        "Charging")     
+            STATUS_SYMBOL="+"
+            STATUS_COLOR="$BLUE"
+            ;;
+        "Discharging")  
+            STATUS_SYMBOL="-"
+            STATUS_COLOR=$(get_battery_color "$CAPACITY")
+            ;;
+        "Full")         
+            STATUS_SYMBOL="="
+            STATUS_COLOR="$GREEN"
+            ;;
+        *)              
+            STATUS_SYMBOL="?"
+            STATUS_COLOR="$YELLOW"
+            ;;
+    esac
+    
+    local PROGRESS=$(format_progress_bar "$CAPACITY")
+    local TIME_FORMAT=$(format_time "$TIME_REMAINING")
+    local CAPACITY_COLOR=$(get_battery_color "$CAPACITY")
+    
+    local TIME_PREFIX
+    if [ "$STATUS" = "Charging" ]; then
+        TIME_PREFIX="Full in"
+    elif [ "$STATUS" = "Discharging" ]; then
+        TIME_PREFIX="Left"
+    else
+        TIME_PREFIX=""
+    fi
+    
+    if [ -n "$TIME_PREFIX" ]; then
+        printf "BAT0 %s %s%3d%%%s %s%s%s %s %s\n" \
+            "$PROGRESS" \
+            "$CAPACITY_COLOR" \
+            "$CAPACITY" \
+            "$RESET" \
+            "$STATUS_COLOR" \
+            "$STATUS_SYMBOL" \
+            "$RESET" \
+            "$TIME_PREFIX" \
+            "$TIME_FORMAT"
+    else
+        printf "BAT0 %s %s%3d%%%s %s%s%s\n" \
+            "$PROGRESS" \
+            "$CAPACITY_COLOR" \
+            "$CAPACITY" \
+            "$RESET" \
+            "$STATUS_COLOR" \
+            "$STATUS_SYMBOL" \
+            "$RESET"
+    fi
+}
+
+get_linux_battery_info() {
+    # Check if any batteries exist
+    BATTERIES=$(ls /sys/class/power_supply/BAT* 2>/dev/null)
+    if [ -z "$BATTERIES" ]; then
+        echo "No battery found"
+        exit 1
+    fi
+    
+    for BATTERY in $BATTERIES; do
+        CAPACITY=$(cat "$BATTERY/capacity" 2>/dev/null || echo "0")
+        STATUS=$(cat "$BATTERY/status" 2>/dev/null || echo "Unknown")
+        POWER=$(cat "$BATTERY/power_now" 2>/dev/null || echo "0")
+        CURRENT=$(cat "$BATTERY/current_now" 2>/dev/null || echo "0")
+        VOLTAGE=$(cat "$BATTERY/voltage_now" 2>/dev/null || echo "0")
+        ENERGY_NOW=$(cat "$BATTERY/energy_now" 2>/dev/null || echo "0")
+        ENERGY_FULL=$(cat "$BATTERY/energy_full" 2>/dev/null || echo "0")
+        
+        # Convert power from microwatts to watts
+        local WATTS=$(echo "scale=2; $POWER / 1000000" | bc)
+        # Convert current from microamps to amps
+        local AMPS=$(echo "scale=2; $CURRENT / 1000000" | bc)
+        
+        local PROGRESS=$(format_progress_bar "$CAPACITY")
+        
+        # Format status with TTY-safe characters and colors
+        local STATUS_SYMBOL
+        local STATUS_COLOR
+        case "$STATUS" in
+            "Charging")     
+                STATUS_SYMBOL="+"
+                STATUS_COLOR="$BLUE"
+                ;;
+            "Discharging")  
+                STATUS_SYMBOL="-"
+                STATUS_COLOR=$(get_battery_color "$CAPACITY")
+                ;;
+            "Full")         
+                STATUS_SYMBOL="="
+                STATUS_COLOR="$GREEN"
+                ;;
+            *)              
+                STATUS_SYMBOL="?"
+                STATUS_COLOR="$YELLOW"
+                ;;
+        esac
+        
+        local TIME_MINS=0
+        if [ "$POWER" -gt 1000 ]; then
+            if [ "$STATUS" = "Charging" ]; then
+                # Calculate time until full
+                local ENERGY_REMAINING=$(( ENERGY_FULL - ENERGY_NOW ))
+                TIME_MINS=$(( (ENERGY_REMAINING * 60) / POWER ))
+            elif [ "$STATUS" = "Discharging" ]; then
+                # Calculate time until empty
+                TIME_MINS=$(( (ENERGY_NOW * 60) / POWER ))
+            fi
+        fi
+        
+        local TIME_FORMAT=$(format_time "$TIME_MINS")
+        local CAPACITY_COLOR=$(get_battery_color "$CAPACITY")
+        
+        local TIME_PREFIX
+        if [ "$STATUS" = "Charging" ]; then
+            TIME_PREFIX="Full in"
+        elif [ "$STATUS" = "Discharging" ]; then
+            TIME_PREFIX="Left"
+        else
+            TIME_PREFIX=""
+        fi
+        
+        if [ -n "$TIME_PREFIX" ]; then
+            printf "%s %s %s%3d%%%s %s%s%s %.2fW %.2fA %s %s\n" \
+                "$(basename "$BATTERY")" \
+                "$PROGRESS" \
+                "$CAPACITY_COLOR" \
+                "$CAPACITY" \
+                "$RESET" \
+                "$STATUS_COLOR" \
+                "$STATUS_SYMBOL" \
+                "$RESET" \
+                "$WATTS" \
+                "$AMPS" \
+                "$TIME_PREFIX" \
+                "$TIME_FORMAT"
+        else
+            printf "%s %s %s%3d%%%s %s%s%s %.2fW %.2fA\n" \
+                "$(basename "$BATTERY")" \
+                "$PROGRESS" \
+                "$CAPACITY_COLOR" \
+                "$CAPACITY" \
+                "$RESET" \
+                "$STATUS_COLOR" \
+                "$STATUS_SYMBOL" \
+                "$RESET" \
+                "$WATTS" \
+                "$AMPS"
+        fi
+    done
+}
+
+# Main execution
+case "$OS" in
+    "Darwin")
+        get_macos_battery_info
+        ;;
+    "Linux")
+        get_linux_battery_info
+        ;;
+    *)
+        echo "Unsupported operating system: $OS"
+        exit 1
+        ;;
+esac
