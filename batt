@@ -157,8 +157,8 @@ get_macos_battery_info() {
 }
 
 get_linux_battery_info() {
-    # Check if any batteries exist
-    BATTERIES=$(ls /sys/class/power_supply/BAT* 2>/dev/null)
+    # Find all available batteries
+    BATTERIES=$(find /sys/class/power_supply -name "BAT*" -type l 2>/dev/null)
     if [ -z "$BATTERIES" ]; then
         echo "No battery found"
         exit 1
@@ -167,16 +167,26 @@ get_linux_battery_info() {
     for BATTERY in $BATTERIES; do
         CAPACITY=$(cat "$BATTERY/capacity" 2>/dev/null || echo "0")
         STATUS=$(cat "$BATTERY/status" 2>/dev/null || echo "Unknown")
-        POWER=$(cat "$BATTERY/power_now" 2>/dev/null || echo "0")
         CURRENT=$(cat "$BATTERY/current_now" 2>/dev/null || echo "0")
         VOLTAGE=$(cat "$BATTERY/voltage_now" 2>/dev/null || echo "0")
-        ENERGY_NOW=$(cat "$BATTERY/energy_now" 2>/dev/null || echo "0")
-        ENERGY_FULL=$(cat "$BATTERY/energy_full" 2>/dev/null || echo "0")
         
-        # Convert power from microwatts to watts
-        local WATTS=$(echo "scale=2; $POWER / 1000000" | bc)
+        # Try energy-based files first, then charge-based files
+        ENERGY_NOW=$(cat "$BATTERY/energy_now" 2>/dev/null || cat "$BATTERY/charge_now" 2>/dev/null || echo "0")
+        ENERGY_FULL=$(cat "$BATTERY/energy_full" 2>/dev/null || cat "$BATTERY/charge_full" 2>/dev/null || echo "0")
+        POWER=$(cat "$BATTERY/power_now" 2>/dev/null || echo "0")
+        
+        # If no power_now, calculate from current and voltage (µA × µV = µW)
+        if [ "$POWER" -eq 0 ] && [ "$CURRENT" -gt 0 ] && [ "$VOLTAGE" -gt 0 ]; then
+            POWER=$(( CURRENT * VOLTAGE / 1000000 ))
+        fi
+        
+        # Convert power from microwatts to watts (using integer arithmetic)
+        local WATTS_INT=$(( POWER / 1000000 ))
+        local WATTS_DEC=$(( (POWER % 1000000) / 10000 ))
+        
         # Convert current from microamps to amps
-        local AMPS=$(echo "scale=2; $CURRENT / 1000000" | bc)
+        local AMPS_INT=$(( CURRENT / 1000000 ))
+        local AMPS_DEC=$(( (CURRENT % 1000000) / 10000 ))
         
         local PROGRESS=$(format_progress_bar "$CAPACITY")
         
@@ -203,14 +213,39 @@ get_linux_battery_info() {
         esac
         
         local TIME_MINS=0
-        if [ "$POWER" -gt 1000 ]; then
-            if [ "$STATUS" = "Charging" ]; then
-                # Calculate time until full
-                local ENERGY_REMAINING=$(( ENERGY_FULL - ENERGY_NOW ))
-                TIME_MINS=$(( (ENERGY_REMAINING * 60) / POWER ))
-            elif [ "$STATUS" = "Discharging" ]; then
-                # Calculate time until empty
-                TIME_MINS=$(( (ENERGY_NOW * 60) / POWER ))
+        
+        # Check if we have energy-based files or charge-based files
+        if [ -f "$BATTERY/energy_now" ]; then
+            # Energy-based calculation (using power in watts)
+            if [ "$POWER" -gt 1000 ]; then
+                if [ "$STATUS" = "Charging" ]; then
+                    # Calculate time until full (minutes)
+                    local ENERGY_REMAINING=$(( ENERGY_FULL - ENERGY_NOW ))
+                    if [ "$ENERGY_REMAINING" -gt 0 ]; then
+                        TIME_MINS=$(( (ENERGY_REMAINING * 60) / POWER ))
+                    fi
+                elif [ "$STATUS" = "Discharging" ]; then
+                    # Calculate time until empty (minutes)
+                    if [ "$ENERGY_NOW" -gt 0 ]; then
+                        TIME_MINS=$(( (ENERGY_NOW * 60) / POWER ))
+                    fi
+                fi
+            fi
+        else
+            # Charge-based calculation (using current in microamps)
+            if [ "$CURRENT" -gt 1000 ]; then
+                if [ "$STATUS" = "Charging" ]; then
+                    # Calculate time until full (minutes)
+                    local CHARGE_REMAINING=$(( ENERGY_FULL - ENERGY_NOW ))
+                    if [ "$CHARGE_REMAINING" -gt 0 ]; then
+                        TIME_MINS=$(( (CHARGE_REMAINING * 60) / CURRENT ))
+                    fi
+                elif [ "$STATUS" = "Discharging" ]; then
+                    # Calculate time until empty (minutes)
+                    if [ "$ENERGY_NOW" -gt 0 ]; then
+                        TIME_MINS=$(( (ENERGY_NOW * 60) / CURRENT ))
+                    fi
+                fi
             fi
         fi
         
@@ -227,7 +262,7 @@ get_linux_battery_info() {
         fi
         
         if [ -n "$TIME_PREFIX" ]; then
-            printf "%s %s %s%3d%%%s %s%s%s %.2fW %.2fA %s %s\n" \
+            printf "%s %s %s%3d%%%s %s%s%s %d.%02dW %d.%02dA %s %s\n" \
                 "$(basename "$BATTERY")" \
                 "$PROGRESS" \
                 "$CAPACITY_COLOR" \
@@ -236,12 +271,14 @@ get_linux_battery_info() {
                 "$STATUS_COLOR" \
                 "$STATUS_SYMBOL" \
                 "$RESET" \
-                "$WATTS" \
-                "$AMPS" \
+                "$WATTS_INT" \
+                "$WATTS_DEC" \
+                "$AMPS_INT" \
+                "$AMPS_DEC" \
                 "$TIME_PREFIX" \
                 "$TIME_FORMAT"
         else
-            printf "%s %s %s%3d%%%s %s%s%s %.2fW %.2fA\n" \
+            printf "%s %s %s%3d%%%s %s%s%s %d.%02dW %d.%02dA\n" \
                 "$(basename "$BATTERY")" \
                 "$PROGRESS" \
                 "$CAPACITY_COLOR" \
@@ -250,8 +287,10 @@ get_linux_battery_info() {
                 "$STATUS_COLOR" \
                 "$STATUS_SYMBOL" \
                 "$RESET" \
-                "$WATTS" \
-                "$AMPS"
+                "$WATTS_INT" \
+                "$WATTS_DEC" \
+                "$AMPS_INT" \
+                "$AMPS_DEC"
         fi
     done
 }
