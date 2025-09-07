@@ -1,5 +1,54 @@
 #!/bin/sh
 
+# Initialize display flags
+SHOW_WATTS=0
+SHOW_PERCENTAGE=0
+SHOW_TIME=0
+SHOW_AMPS=0
+SHOW_ALL=1
+
+# Parse command line arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -w|--watts)
+            SHOW_WATTS=1
+            SHOW_ALL=0
+            ;;
+        -p|--percentage)
+            SHOW_PERCENTAGE=1
+            SHOW_ALL=0
+            ;;
+        -t|--time)
+            SHOW_TIME=1
+            SHOW_ALL=0
+            ;;
+        -a|--amps)
+            SHOW_AMPS=1
+            SHOW_ALL=0
+            ;;
+        -h|--help)
+            echo "Usage: batt [OPTIONS]"
+            echo "Show battery information"
+            echo ""
+            echo "Options:"
+            echo "  -w, --watts       Show only wattage information"
+            echo "  -p, --percentage  Show only percentage information"
+            echo "  -t, --time        Show only time remaining information"
+            echo "  -a, --amps        Show only amperage information"
+            echo "  -h, --help        Show this help message"
+            echo ""
+            echo "Without any options, shows all battery information"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Use -h or --help for usage information" >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
 # Detect OS
 OS=$(uname -s)
 
@@ -65,96 +114,6 @@ format_time() {
     printf "%02d:%02d" "$HOURS" "$MINS"
 }
 
-get_macos_battery_info() {
-    # Get raw battery data
-    local DATA=$(pmset -g batt)
-    if ! echo "$DATA" | grep -q "InternalBattery"; then
-        echo "No battery found"
-        exit 1
-    fi
-
-    # Extract battery percentage
-    local CAPACITY=$(echo "$DATA" | grep -o '[0-9]*%' | tr -d '%')
-    
-    # Extract charging status
-    local RAW_STATUS=$(echo "$DATA" | grep -o ".*;" | tr -d ';' | awk '{print $NF}')
-    local STATUS
-    case "$RAW_STATUS" in
-        "charging") STATUS="Charging" ;;
-        "discharging") STATUS="Discharging" ;;
-        "charged") STATUS="Full" ;;
-        "AC attached") STATUS="Full" ;;
-        *) STATUS="Unknown" ;;
-    esac
-    
-    # Extract time remaining
-    local TIME_REMAINING=0
-    if [ "$STATUS" != "Full" ]; then
-        local TIME_STR=$(echo "$DATA" | grep -o '[0-9]*:[0-9]* remaining' | awk '{print $1}' || echo "0:0")
-        if [ -n "$TIME_STR" ]; then
-            local HOURS=$(echo "$TIME_STR" | cut -d: -f1)
-            local MINS=$(echo "$TIME_STR" | cut -d: -f2)
-            TIME_REMAINING=$(( ${HOURS:-0} * 60 + ${MINS:-0} ))
-        fi
-    fi
-    
-    # Format status symbol with color
-    local STATUS_SYMBOL
-    local STATUS_COLOR
-    case "$STATUS" in
-        "Charging")     
-            STATUS_SYMBOL="+"
-            STATUS_COLOR="$BLUE"
-            ;;
-        "Discharging")  
-            STATUS_SYMBOL="-"
-            STATUS_COLOR=$(get_battery_color "$CAPACITY")
-            ;;
-        "Full")         
-            STATUS_SYMBOL="="
-            STATUS_COLOR="$GREEN"
-            ;;
-        *)              
-            STATUS_SYMBOL="?"
-            STATUS_COLOR="$YELLOW"
-            ;;
-    esac
-    
-    local PROGRESS=$(format_progress_bar "$CAPACITY")
-    local TIME_FORMAT=$(format_time "$TIME_REMAINING")
-    local CAPACITY_COLOR=$(get_battery_color "$CAPACITY")
-    
-    local TIME_PREFIX
-    if [ "$STATUS" = "Charging" ]; then
-        TIME_PREFIX="Full in"
-    elif [ "$STATUS" = "Discharging" ]; then
-        TIME_PREFIX="Left"
-    else
-        TIME_PREFIX=""
-    fi
-    
-    if [ -n "$TIME_PREFIX" ]; then
-        printf "BAT0 %s %s%3d%%%s %s%s%s %s %s\n" \
-            "$PROGRESS" \
-            "$CAPACITY_COLOR" \
-            "$CAPACITY" \
-            "$RESET" \
-            "$STATUS_COLOR" \
-            "$STATUS_SYMBOL" \
-            "$RESET" \
-            "$TIME_PREFIX" \
-            "$TIME_FORMAT"
-    else
-        printf "BAT0 %s %s%3d%%%s %s%s%s\n" \
-            "$PROGRESS" \
-            "$CAPACITY_COLOR" \
-            "$CAPACITY" \
-            "$RESET" \
-            "$STATUS_COLOR" \
-            "$STATUS_SYMBOL" \
-            "$RESET"
-    fi
-}
 
 get_linux_battery_info() {
     # Find all available batteries
@@ -261,50 +220,64 @@ get_linux_battery_info() {
             TIME_PREFIX=""
         fi
         
-        if [ -n "$TIME_PREFIX" ]; then
-            printf "%s %s %s%3d%%%s %s%s%s %d.%02dW %d.%02dA %s %s\n" \
-                "$(basename "$BATTERY")" \
-                "$PROGRESS" \
-                "$CAPACITY_COLOR" \
-                "$CAPACITY" \
-                "$RESET" \
-                "$STATUS_COLOR" \
-                "$STATUS_SYMBOL" \
-                "$RESET" \
-                "$WATTS_INT" \
-                "$WATTS_DEC" \
-                "$AMPS_INT" \
-                "$AMPS_DEC" \
-                "$TIME_PREFIX" \
-                "$TIME_FORMAT"
+        # Display based on flags
+        if [ "$SHOW_ALL" -eq 1 ]; then
+            if [ -n "$TIME_PREFIX" ]; then
+                printf "%s %s %s%3d%%%s %s%s%s %d.%02dW %d.%02dA %s %s\n" \
+                    "$(basename "$BATTERY")" \
+                    "$PROGRESS" \
+                    "$CAPACITY_COLOR" \
+                    "$CAPACITY" \
+                    "$RESET" \
+                    "$STATUS_COLOR" \
+                    "$STATUS_SYMBOL" \
+                    "$RESET" \
+                    "$WATTS_INT" \
+                    "$WATTS_DEC" \
+                    "$AMPS_INT" \
+                    "$AMPS_DEC" \
+                    "$TIME_PREFIX" \
+                    "$TIME_FORMAT"
+            else
+                printf "%s %s %s%3d%%%s %s%s%s %d.%02dW %d.%02dA\n" \
+                    "$(basename "$BATTERY")" \
+                    "$PROGRESS" \
+                    "$CAPACITY_COLOR" \
+                    "$CAPACITY" \
+                    "$RESET" \
+                    "$STATUS_COLOR" \
+                    "$STATUS_SYMBOL" \
+                    "$RESET" \
+                    "$WATTS_INT" \
+                    "$WATTS_DEC" \
+                    "$AMPS_INT" \
+                    "$AMPS_DEC"
+            fi
         else
-            printf "%s %s %s%3d%%%s %s%s%s %d.%02dW %d.%02dA\n" \
-                "$(basename "$BATTERY")" \
-                "$PROGRESS" \
-                "$CAPACITY_COLOR" \
-                "$CAPACITY" \
-                "$RESET" \
-                "$STATUS_COLOR" \
-                "$STATUS_SYMBOL" \
-                "$RESET" \
-                "$WATTS_INT" \
-                "$WATTS_DEC" \
-                "$AMPS_INT" \
-                "$AMPS_DEC"
+            # Individual component display
+            if [ "$SHOW_PERCENTAGE" -eq 1 ]; then
+                printf "%s%3d%%%s\n" "$CAPACITY_COLOR" "$CAPACITY" "$RESET"
+            fi
+            if [ "$SHOW_WATTS" -eq 1 ]; then
+                printf "%d.%02dW\n" "$WATTS_INT" "$WATTS_DEC"
+            fi
+            if [ "$SHOW_AMPS" -eq 1 ]; then
+                printf "%d.%02dA\n" "$AMPS_INT" "$AMPS_DEC"
+            fi
+            if [ "$SHOW_TIME" -eq 1 ] && [ -n "$TIME_PREFIX" ]; then
+                printf "%s %s\n" "$TIME_PREFIX" "$TIME_FORMAT"
+            fi
         fi
     done
 }
 
 # Main execution
 case "$OS" in
-    "Darwin")
-        get_macos_battery_info
-        ;;
     "Linux")
         get_linux_battery_info
         ;;
     *)
-        echo "Unsupported operating system: $OS"
+        echo "Unsupported operating system: $OS (Linux only)"
         exit 1
         ;;
 esac
