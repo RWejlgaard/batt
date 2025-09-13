@@ -1,229 +1,158 @@
-# Batt - Cross-Platform Battery Monitor
+# Batt - Assembly Battery Monitor
 
-A lightweight, cross-platform shell script for monitoring battery status with colored progress bars and detailed power information.
+A lightweight battery monitoring tool written in pure x86-64 assembly for Linux systems. Displays real-time battery information with color-coded output and progress bars.
 
 ## Features
 
-- **Cross-platform compatibility**: Works on macOS and Linux
-- **Color-coded display**: Visual feedback with red (low), yellow (moderate), and green (high) battery levels
-- **Progress bar visualization**: ASCII progress bar showing battery charge level
-- **Detailed power metrics**: Current consumption, voltage, and time estimates
-- **Multiple battery support**: Handles systems with multiple batteries (Linux)
-- **Terminal-safe output**: Automatically detects terminal capabilities and adjusts accordingly
+- **Visual Progress Bar**: 20-character battery level indicator with color coding
+- **Color-coded Output**: Red (≤10%), Yellow (≤25%), Green (>25%)
+- **Multiple Display Modes**: Show all info, watts only, or percentage only
+- **Real-time Metrics**: Current charge, voltage, power consumption, and time remaining
+- **Status Indicators**: Charging (+), Discharging (-), Full (=), Unknown (?)
+- **Time Estimation**: Shows charging time or discharge time remaining
 
-## Sample Output
+## Caveat
 
-```
-BAT0 [########--------] 40% - Discharging 12.5W 2.3A Left 02:15
-BAT1 [############----] 60% + Charging 8.2W 1.8A Full in 01:30
-```
+This was written and tested on my specific machine. The battery path may be different on other machines!
 
 ## Installation
 
-### Option 1: Direct Download
+### Prerequisites
+- Linux system with `/sys/class/power_supply/BAT1/` battery interface
+- NASM assembler
+- GNU linker (ld)
 
-1. Download the `batt` script to your desired location:
-   ```bash
-   wget https://raw.githubusercontent.com/your-repo/batt/main/batt
-   # or
-   curl -O https://raw.githubusercontent.com/your-repo/batt/main/batt
-   ```
-
-2. Make it executable:
-   ```bash
-   chmod +x batt
-   ```
-
-3. (Optional) Move to a directory in your PATH:
-   ```bash
-   sudo mv batt /usr/local/bin/
-   ```
-
-### Option 2: Clone Repository
-
+### Build from Source
 ```bash
-git clone https://github.com/your-repo/batt.git
-cd batt
-chmod +x batt
-# Optional: Add to PATH
-sudo ln -s "$(pwd)/batt" /usr/local/bin/batt
+make
+```
+
+### Install System-wide (Optional)
+```bash
+sudo make install
+```
+
+### Clean Build Files
+```bash
+make clean
 ```
 
 ## Usage
 
 ### Basic Usage
-
-Simply run the script to display current battery status:
-
+Display all battery information:
 ```bash
 ./batt
 ```
 
-Or if installed in PATH:
+Example output:
+```
+BAT1 [##########----------] 50% - 5.23W 0.78A 2:30 Left
+```
+
+### Command Line Options
 
 ```bash
-batt
+./batt [OPTIONS]
 ```
 
-### Integration Examples
+| Option | Description |
+|--------|-------------|
+| `-w, --watts` | Show only wattage information |
+| `-p, --percentage` | Show only percentage information |
+| `-h, --help` | Show help message |
 
-#### Add to Shell Prompt
+### Examples
 
-Add to your `.bashrc` or `.zshrc` for always-visible battery status:
-
+Show only battery percentage:
 ```bash
-# Add battery info to PS1
-export PS1='$(batt) '"$PS1"
+./batt -p
+# Output: 75%
 ```
 
-#### Status Bar Integration
-
-For window managers like i3, dwm, or status bars:
-
+Show only power consumption:
 ```bash
-# i3status configuration
-bar {
-    status_command while date +'%Y-%m-%d %H:%M:%S'; do echo "$(batt) | $(date)"; sleep 1; done
-}
+./batt -w
+# Output: 12.45W
 ```
 
-#### Tmux Integration
+## How It Works
 
-Add to your tmux status line:
+### High-Level Architecture
 
-```bash
-# In ~/.tmux.conf
-set -g status-right '#(batt) | %Y-%m-%d %H:%M'
+The program is structured as a single-pass system that:
+
+1. **Argument Parsing**: Processes command line flags using string comparison
+2. **Data Collection**: Reads battery metrics from Linux sysfs interface
+3. **Calculation**: Computes power consumption and time estimates
+4. **Display**: Formats and outputs color-coded information
+
+### Battery Data Sources
+
+The tool reads from standard Linux power supply interfaces:
+
+- `/sys/class/power_supply/BAT1/capacity` - Battery percentage (0-100)
+- `/sys/class/power_supply/BAT1/status` - Charging status (Charging/Discharging/Full)
+- `/sys/class/power_supply/BAT1/current_now` - Current draw in microamps
+- `/sys/class/power_supply/BAT1/voltage_now` - Voltage in microvolts
+- `/sys/class/power_supply/BAT1/charge_now` - Current charge in microamp-hours
+- `/sys/class/power_supply/BAT1/charge_full` - Full capacity in microamp-hours
+
+### Key Calculations
+
+**Power Consumption**:
+```
+Power (watts) = (current_now × voltage_now) ÷ 1,000,000
 ```
 
-#### Scheduled Monitoring
+**Time Remaining**:
+- **Discharging**: `time = (charge_now × 60) ÷ current_now` minutes
+- **Charging**: `time = ((charge_full - charge_now) × 60) ÷ current_now` minutes
 
-Monitor battery levels with cron:
+**Progress Bar**:
+- 20 characters total
+- Filled bars: `(capacity × 20) ÷ 100`
+- Color coding based on percentage thresholds
 
-```bash
-# Add to crontab for low battery alerts
-*/5 * * * * if [ $(batt | grep -o '[0-9]*%' | tr -d '%') -lt 15 ]; then notify-send "Low Battery"; fi
-```
+### Assembly Implementation Details
 
-## Technical Details
-
-### How It Works
-
-#### macOS Implementation
-- Uses `pmset -g batt` to query battery information
-- Parses output to extract capacity, charging status, and time remaining
-- Handles various charging states: charging, discharging, charged, AC attached
-
-#### Linux Implementation
-- Reads from `/sys/class/power_supply/BAT*` directories
-- Supports multiple batteries automatically
-- Calculates power consumption and time estimates from:
-  - `capacity`: Battery charge percentage
-  - `status`: Charging state
-  - `power_now`: Current power consumption (µW)
-  - `current_now`: Current draw (µA)
-  - `voltage_now`: Current voltage (µV)
-  - `energy_now/energy_full`: Current/full energy capacity (µWh)
-
-### Output Format
-
-The script outputs information in this format:
-
-```
-BATTERY_NAME [PROGRESS_BAR] PERCENTAGE% STATUS POWER CURRENT TIME_INFO
-```
-
-Where:
-- **BATTERY_NAME**: Battery identifier (BAT0, BAT1, etc.)
-- **PROGRESS_BAR**: 20-character ASCII bar showing charge level
-- **PERCENTAGE**: Current charge percentage with color coding
-- **STATUS**: Charging state with symbols:
-  - `+` Charging (blue)
-  - `-` Discharging (color-coded by level)
-  - `=` Full (green)
-  - `?` Unknown (yellow)
-- **POWER**: Current power consumption in watts
-- **CURRENT**: Current draw in amperes
-- **TIME_INFO**: Time remaining or time to full charge
-
-### Color Coding
-
-- **Red**: ≤ 10% battery (critical)
-- **Yellow**: 11-25% battery (low)
-- **Green**: > 25% battery (normal)
-- **Blue**: Charging status
+- **System Calls**: Uses direct Linux syscalls for file I/O (`sys_open`, `sys_read`, `sys_write`)
+- **Memory Management**: Static buffers for file operations and string processing
+- **Number Conversion**: Custom ASCII-to-integer and integer-to-ASCII routines
+- **String Operations**: Hand-coded string comparison and length calculation
+- **Color Output**: ANSI escape sequences for terminal colors
 
 ## Requirements
 
-### macOS
-- Built-in `pmset` command (available on all macOS systems)
-- Shell with POSIX compliance (`/bin/sh`)
+- Linux kernel with sysfs power supply interface
+- Battery device at `/sys/class/power_supply/BAT1/`
+- x86-64 architecture
+- Terminal with ANSI color support
 
-### Linux
-- Access to `/sys/class/power_supply/` directory
-- `bc` calculator for power calculations
-- Shell with POSIX compliance (`/bin/sh`)
+## Technical Specifications
 
-### Install Linux Dependencies
-
-On Ubuntu/Debian:
-```bash
-sudo apt-get install bc
-```
-
-On CentOS/RHEL/Fedora:
-```bash
-sudo yum install bc
-# or
-sudo dnf install bc
-```
+- **Language**: x86-64 Assembly (Intel syntax)
+- **Assembler**: NASM
+- **Target**: Linux ELF64
+- **Dependencies**: None (uses only Linux syscalls)
+- **Memory Usage**: ~1KB static buffers
+- **Performance**: Sub-millisecond execution time
 
 ## Troubleshooting
 
-### "No battery found"
-- **macOS**: Ensure you're running on a MacBook or device with battery
-- **Linux**: Check that `/sys/class/power_supply/BAT*` directories exist
+**"No battery found" error**:
+- Verify battery exists: `ls /sys/class/power_supply/`
+- Check if your battery is named differently (BAT0, BAT2, etc.)
+- Ensure proper file permissions
 
-### No colors displayed
-- Ensure your terminal supports ANSI colors
-- Check that `$TERM` environment variable is set correctly
-- Try running in a different terminal emulator
+**Permission denied**:
+- Battery files should be readable by all users
+- No special privileges required
 
-### Incorrect time calculations
-- Time estimates are calculated based on current power consumption
-- Estimates become more accurate over time as power usage stabilizes
-- May show `--:--` when power consumption data is unavailable
-
-### Permission denied
-- Ensure the script has execute permissions: `chmod +x batt`
-- On Linux, ensure access to `/sys/class/power_supply/` (usually readable by all users)
-
-## Contributing
-
-Contributions are welcome! Please feel free to:
-- Report bugs
-- Suggest features
-- Submit pull requests
-- Improve documentation
+**Incorrect readings**:
+- Some laptops may use different power supply interfaces
+- Check `lspci` for power management controllers
 
 ## License
 
-This project is released under the MIT License. See LICENSE file for details.
-
-## Compatibility
-
-### Tested Platforms
-- macOS 10.14+
-- Ubuntu 18.04+
-- Debian 9+
-- CentOS 7+
-- Arch Linux
-- Fedora 28+
-
-### Shell Compatibility
-- bash
-- zsh
-- dash
-- sh (POSIX)
-
-The script is designed to be POSIX-compliant and should work with any POSIX-compatible shell.
+This project is open source. See the source code for implementation details.
