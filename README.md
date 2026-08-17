@@ -5,20 +5,17 @@ A lightweight battery monitoring tool written in pure x86-64 assembly for Linux 
 ## Features
 
 - **Visual Progress Bar**: 20-character battery level indicator with color coding
-- **Color-coded Output**: Red (≤10%), Yellow (≤25%), Green (>25%)
-- **Multiple Display Modes**: Show all info, watts only, or percentage only
+- **Color-coded Output**: Red (≤10%), Yellow (≤25%), Green (>25%) — only when writing to a terminal
+- **Multiple Display Modes**: Show everything, or any combination of percentage, watts, amps and time
 - **Real-time Metrics**: Current charge, voltage, power consumption, and time remaining
 - **Status Indicators**: Charging (+), Discharging (-), Full (=), Unknown (?)
 - **Time Estimation**: Shows charging time or discharge time remaining
-
-## Caveat
-
-This was written and tested on my specific machine. The battery path may be different on other machines!
+- **Automatic Battery Detection**: Finds every `BAT*` device, no hardcoded paths
 
 ## Installation
 
 ### Prerequisites
-- Linux system with `/sys/class/power_supply/BAT1/` battery interface
+- Linux system with a `/sys/class/power_supply/` battery interface
 - NASM assembler
 - GNU linker (ld)
 
@@ -47,7 +44,7 @@ Display all battery information:
 
 Example output:
 ```
-BAT1 [##########----------] 50% - 5.23W 0.78A 2:30 Left
+BAT1 [##########----------]  50% - 8.58W 0.78A Left 03:12
 ```
 
 ### Command Line Options
@@ -60,20 +57,30 @@ BAT1 [##########----------] 50% - 5.23W 0.78A 2:30 Left
 |--------|-------------|
 | `-w, --watts` | Show only wattage information |
 | `-p, --percentage` | Show only percentage information |
+| `-t, --time` | Show only time remaining information |
+| `-a, --amps` | Show only amperage information |
 | `-h, --help` | Show help message |
+
+Options can be combined; each requested field is printed on its own line.
 
 ### Examples
 
 Show only battery percentage:
 ```bash
 ./batt -p
-# Output: 75%
+# Output:  75%
 ```
 
 Show only power consumption:
 ```bash
 ./batt -w
 # Output: 12.45W
+```
+
+Show time remaining:
+```bash
+./batt -t
+# Output: Left 03:12
 ```
 
 ## How It Works
@@ -83,31 +90,48 @@ Show only power consumption:
 The program is structured as a single-pass system that:
 
 1. **Argument Parsing**: Processes command line flags using string comparison
-2. **Data Collection**: Reads battery metrics from Linux sysfs interface
-3. **Calculation**: Computes power consumption and time estimates
-4. **Display**: Formats and outputs color-coded information
+2. **Battery Discovery**: Scans `/sys/class/power_supply/` for battery devices
+3. **Data Collection**: Reads battery metrics from Linux sysfs interface
+4. **Calculation**: Computes power consumption and time estimates
+5. **Display**: Formats the whole line in memory and writes it with one syscall
+
+### Battery Discovery
+
+Every `BAT*` entry under `/sys/class/power_supply/` is reported, in order. If there
+is no `BAT*` entry, the first device exposing a `capacity` file is used instead, which
+covers machines that name their battery differently.
 
 ### Battery Data Sources
 
 The tool reads from standard Linux power supply interfaces:
 
-- `/sys/class/power_supply/BAT1/capacity` - Battery percentage (0-100)
-- `/sys/class/power_supply/BAT1/status` - Charging status (Charging/Discharging/Full)
-- `/sys/class/power_supply/BAT1/current_now` - Current draw in microamps
-- `/sys/class/power_supply/BAT1/voltage_now` - Voltage in microvolts
-- `/sys/class/power_supply/BAT1/charge_now` - Current charge in microamp-hours
-- `/sys/class/power_supply/BAT1/charge_full` - Full capacity in microamp-hours
+- `capacity` - Battery percentage (0-100)
+- `status` - Charging status (Charging/Discharging/Full)
+- `current_now` - Current draw in microamps
+- `voltage_now` - Voltage in microvolts
+- `power_now` - Power draw in microwatts
+- `charge_now` / `charge_full` - Charge in microamp-hours
+- `energy_now` / `energy_full` - Energy in microwatt-hours
+
+Batteries report either charge (`charge_*` + `current_now`) or energy (`energy_*` +
+`power_now`); both are handled, and whichever of power/current is missing is derived
+from the other.
 
 ### Key Calculations
 
-**Power Consumption**:
+**Power** (when `power_now` is absent):
 ```
-Power (watts) = (current_now × voltage_now) ÷ 1,000,000
+power (µW) = (current_now × voltage_now) ÷ 1,000,000
 ```
 
-**Time Remaining**:
-- **Discharging**: `time = (charge_now × 60) ÷ current_now` minutes
-- **Charging**: `time = ((charge_full - charge_now) × 60) ÷ current_now` minutes
+**Current** (when `current_now` is absent):
+```
+current (µA) = (power_now × 1,000,000) ÷ voltage_now
+```
+
+**Time Remaining** (rate is `current_now` for charge-based batteries, `power_now` for energy-based ones):
+- **Discharging**: `time = (now × 60) ÷ rate` minutes
+- **Charging**: `time = ((full - now) × 60) ÷ rate` minutes
 
 **Progress Bar**:
 - 20 characters total
@@ -116,18 +140,18 @@ Power (watts) = (current_now × voltage_now) ÷ 1,000,000
 
 ### Assembly Implementation Details
 
-- **System Calls**: Uses direct Linux syscalls for file I/O (`sys_open`, `sys_read`, `sys_write`)
+- **System Calls**: Direct Linux syscalls only (`open`, `read`, `write`, `close`, `getdents64`, `ioctl`)
+- **No libc**: Statically linked, no dynamic loader at startup
 - **Memory Management**: Static buffers for file operations and string processing
 - **Number Conversion**: Custom ASCII-to-integer and integer-to-ASCII routines
 - **String Operations**: Hand-coded string comparison and length calculation
-- **Color Output**: ANSI escape sequences for terminal colors
+- **Color Output**: ANSI escape sequences, suppressed when stdout is not a terminal
 
 ## Requirements
 
 - Linux kernel with sysfs power supply interface
-- Battery device at `/sys/class/power_supply/BAT1/`
 - x86-64 architecture
-- Terminal with ANSI color support
+- Terminal with ANSI color support (optional)
 
 ## Technical Specifications
 
@@ -135,14 +159,13 @@ Power (watts) = (current_now × voltage_now) ÷ 1,000,000
 - **Assembler**: NASM
 - **Target**: Linux ELF64
 - **Dependencies**: None (uses only Linux syscalls)
-- **Memory Usage**: ~1KB static buffers
+- **Memory Usage**: ~2KB static buffers
 - **Performance**: Sub-millisecond execution time
 
 ## Troubleshooting
 
 **"No battery found" error**:
-- Verify battery exists: `ls /sys/class/power_supply/`
-- Check if your battery is named differently (BAT0, BAT2, etc.)
+- Verify a battery exists: `ls /sys/class/power_supply/`
 - Ensure proper file permissions
 
 **Permission denied**:
