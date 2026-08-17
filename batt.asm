@@ -1,7 +1,30 @@
 ; batt.asm - Battery monitoring tool in x86-64 assembly
-; Linux only implementation using system calls
+; Linux only, direct syscalls, no libc.
 
-section .data
+%define SYS_read       0
+%define SYS_write      1
+%define SYS_open       2
+%define SYS_close      3
+%define SYS_ioctl      16
+%define SYS_exit       60
+%define SYS_getdents64 217
+
+%define STDOUT 1
+%define STDERR 2
+%define TCGETS 0x5401
+%define O_RDONLY_DIR 0x10000        ; O_RDONLY | O_DIRECTORY
+
+%define BAR_WIDTH 20
+%define MAX_BATS  8
+%define NAME_MAX  32
+%define DENTS_SZ  1024
+
+%define ST_UNKNOWN     0
+%define ST_CHARGING    1
+%define ST_DISCHARGING 2
+%define ST_FULL        3
+
+section .rodata
     ; ANSI color codes
     red_color        db 27, '[31m', 0
     green_color      db 27, '[32m', 0
@@ -9,7 +32,6 @@ section .data
     blue_color       db 27, '[34m', 0
     reset_color      db 27, '[0m', 0
 
-    ; Messages
     usage_msg        db 'Usage: batt [OPTIONS]', 10
                      db 'Show battery information', 10, 10
                      db 'Options:', 10
@@ -18,9 +40,14 @@ section .data
                      db '  -t, --time        Show only time remaining information', 10
                      db '  -a, --amps        Show only amperage information', 10
                      db '  -h, --help        Show this help message', 10, 10
-                     db 'Without any options, shows all battery information', 10, 0
+                     db 'Without any options, shows all battery information', 10
+    usage_len        equ $ - usage_msg
 
-    no_battery_msg   db 'No battery found', 10, 0
+    no_battery_msg   db 'No battery found', 10
+    no_battery_len   equ $ - no_battery_msg
+
+    unknown_opt_msg  db 'Unknown option: ', 0
+    use_help_msg     db 10, 'Use -h or --help for usage information', 10, 0
 
     ; Command line options
     help_short       db '-h', 0
@@ -34,32 +61,17 @@ section .data
     amps_short       db '-a', 0
     amps_long        db '--amps', 0
 
-    ; File paths
-    capacity_file    db '/sys/class/power_supply/BAT1/capacity', 0
-    status_file      db '/sys/class/power_supply/BAT1/status', 0
-    current_file     db '/sys/class/power_supply/BAT1/current_now', 0
-    voltage_file     db '/sys/class/power_supply/BAT1/voltage_now', 0
-    charge_now_file  db '/sys/class/power_supply/BAT1/charge_now', 0
-    charge_full_file db '/sys/class/power_supply/BAT1/charge_full', 0
-
-    ; Display characters
-    newline          db 10, 0
-    percent_char     db '%', 0
-    w_char           db 'W', 0
-    a_char           db 'A', 0
-    space_char       db ' ', 0
-    dot_char         db '.', 0
-    bracket_open     db '[', 0
-    bracket_close    db ']', 0
-    hash_char        db '#', 0
-    dash_char        db '-', 0
-
-    ; Battery name and status symbols
-    bat_name         db 'BAT1 ', 0
-    charging_symbol  db '+', 0
-    discharging_symbol db '-', 0
-    full_symbol      db '=', 0
-    unknown_symbol   db '?', 0
+    ; sysfs
+    supply_dir       db '/sys/class/power_supply/', 0
+    a_capacity       db 'capacity', 0
+    a_status         db 'status', 0
+    a_current        db 'current_now', 0
+    a_voltage        db 'voltage_now', 0
+    a_power          db 'power_now', 0
+    a_energy_now     db 'energy_now', 0
+    a_energy_full    db 'energy_full', 0
+    a_charge_now     db 'charge_now', 0
+    a_charge_full    db 'charge_full', 0
 
     ; Status strings for comparison
     charging_str     db 'Charging', 0
@@ -67,9 +79,9 @@ section .data
     full_str         db 'Full', 0
 
     ; Time display strings
-    full_in_str      db 'Full in ', 0
-    left_str         db 'Left ', 0
-    colon_str        db ':', 0
+    full_in_str      db 'Full in', 0
+    left_str         db 'Left', 0
+    no_time_str      db '--:--', 0
 
 section .bss
     ; Command line flags
@@ -78,1161 +90,923 @@ section .bss
     show_time        resb 1
     show_amps        resb 1
     show_all         resb 1
+    use_color        resb 1
 
-    ; Buffer for file operations
-    file_buffer      resb 256
-    temp_buffer      resb 64
+    ; Battery discovery
+    bat_names        resb MAX_BATS * NAME_MAX
+    fallback_name    resb NAME_MAX
+    bat_count        resq 1
+    cur_name         resq 1
+    dirfd            resq 1
+    dents_len        resq 1
+    dents_off        resq 1
+    dirent_buf       resb DENTS_SZ
 
-    ; Pre-allocated buffers for batch reading
-    capacity_buf     resb 16
-    current_buf      resb 16
-    voltage_buf      resb 16
-    charge_now_buf   resb 16
-    charge_full_buf  resb 16
+    ; Path building
+    path_buf         resb 256
+    bat_path_len     resq 1
 
     ; Battery data
     capacity         resq 1
     current_now      resq 1
     voltage_now      resq 1
-    charge_now       resq 1
-    charge_full      resq 1
-    power_now        resq 1  ; calculated from current * voltage
+    power_now        resq 1
+    energy_now       resq 1
+    energy_full      resq 1
+    energy_based     resq 1     ; 1 if the battery reports energy_* rather than charge_*
+    rate             resq 1
+    time_mins        resq 1
+    status_code      resq 1
+    status_str       resb NAME_MAX
 
-    ; Progress bar data
-    filled_count     resq 1
-    empty_count      resq 1
-
-    ; Status string
-    status_str       resb 32
+    ; Scratch
+    num_buf          resb 40
+    num_tmp          resb 32
+    termios_buf      resb 64
+    out_buf          resb 512
 
 section .text
     global _start
 
+; Compare argv entry in r10 against a short and a long option
+%macro CHECKOPT 3
+    mov rdi, r10
+    mov rsi, %1
+    call str_eq
+    test al, al
+    jnz %3
+    mov rdi, r10
+    mov rsi, %2
+    call str_eq
+    test al, al
+    jnz %3
+%endmacro
+
 _start:
-    ; Initialize flags
     mov byte [show_all], 1
-    mov byte [show_watts], 0
-    mov byte [show_percentage], 0
-    mov byte [show_time], 0
-    mov byte [show_amps], 0
 
-    ; Get argc from stack
-    pop rdi         ; argc
-    pop rsi         ; argv[0] (skip program name)
+    mov r12, [rsp]              ; argc
+    lea r13, [rsp+8]            ; argv
+    mov r14, 1
 
-    dec rdi         ; Adjust argc (don't count program name)
-    jz main_program ; No arguments, show all
+.arg_loop:
+    cmp r14, r12
+    jge .args_done
+    mov r10, [r13 + r14*8]
 
-parse_args_loop:
-    test rdi, rdi
-    jz main_program
+    CHECKOPT help_short, help_long, show_help
+    CHECKOPT watts_short, watts_long, .set_watts
+    CHECKOPT percentage_short, percentage_long, .set_percentage
+    CHECKOPT time_short, time_long, .set_time
+    CHECKOPT amps_short, amps_long, .set_amps
+    jmp unknown_option
 
-    pop rsi         ; Get next argument
-
-    ; Check for help
-    push rdi
-    push rsi
-    mov rdi, rsi
-    mov rsi, help_short
-    call string_compare
-    pop rsi
-    pop rdi
-    test rax, rax
-    jz show_help
-
-    ; Check for watts
-    push rdi
-    push rsi
-    mov rdi, rsi
-    mov rsi, watts_short
-    call string_compare
-    pop rsi
-    pop rdi
-    test rax, rax
-    jz set_watts
-
-    ; Check for percentage
-    push rdi
-    push rsi
-    mov rdi, rsi
-    mov rsi, percentage_short
-    call string_compare
-    pop rsi
-    pop rdi
-    test rax, rax
-    jz set_percentage
-
-    ; Check for time
-    push rdi
-    push rsi
-    mov rdi, rsi
-    mov rsi, time_short
-    call string_compare
-    pop rsi
-    pop rdi
-    test rax, rax
-    jz set_time
-
-    ; Check for amps
-    push rdi
-    push rsi
-    mov rdi, rsi
-    mov rsi, amps_short
-    call string_compare
-    pop rsi
-    pop rdi
-    test rax, rax
-    jz set_amps
-
-    ; Check for long help
-    push rdi
-    push rsi
-    mov rdi, rsi
-    mov rsi, help_long
-    call string_compare
-    pop rsi
-    pop rdi
-    test rax, rax
-    jz show_help
-
-    ; Check for long watts
-    push rdi
-    push rsi
-    mov rdi, rsi
-    mov rsi, watts_long
-    call string_compare
-    pop rsi
-    pop rdi
-    test rax, rax
-    jz set_watts
-
-    ; Check for long percentage
-    push rdi
-    push rsi
-    mov rdi, rsi
-    mov rsi, percentage_long
-    call string_compare
-    pop rsi
-    pop rdi
-    test rax, rax
-    jz set_percentage
-
-    ; Check for long time
-    push rdi
-    push rsi
-    mov rdi, rsi
-    mov rsi, time_long
-    call string_compare
-    pop rsi
-    pop rdi
-    test rax, rax
-    jz set_time
-
-    ; Check for long amps
-    push rdi
-    push rsi
-    mov rdi, rsi
-    mov rsi, amps_long
-    call string_compare
-    pop rsi
-    pop rdi
-    test rax, rax
-    jz set_amps
-
-    ; Unknown argument, continue
-    dec rdi
-    jmp parse_args_loop
-
-set_watts:
+.set_watts:
     mov byte [show_watts], 1
-    mov byte [show_all], 0
-    dec rdi
-    jmp parse_args_loop
-
-set_percentage:
+    jmp .flag_done
+.set_percentage:
     mov byte [show_percentage], 1
-    mov byte [show_all], 0
-    dec rdi
-    jmp parse_args_loop
-
-set_time:
+    jmp .flag_done
+.set_time:
     mov byte [show_time], 1
-    mov byte [show_all], 0
-    dec rdi
-    jmp parse_args_loop
-
-set_amps:
+    jmp .flag_done
+.set_amps:
     mov byte [show_amps], 1
+.flag_done:
     mov byte [show_all], 0
-    dec rdi
-    jmp parse_args_loop
+    inc r14
+    jmp .arg_loop
+
+.args_done:
+    call detect_tty
+    call scan_batteries
+
+    cmp qword [bat_count], 0
+    je no_battery
+
+    xor r15, r15
+.bat_loop:
+    cmp r15, [bat_count]
+    jge .exit_ok
+
+    mov rax, NAME_MAX
+    mul r15
+    lea rdi, [bat_names + rax]
+    call set_bat_path
+    call read_battery
+    call render
+
+    inc r15
+    jmp .bat_loop
+
+.exit_ok:
+    xor edi, edi
+    mov eax, SYS_exit
+    syscall
 
 show_help:
-    mov rax, 1          ; sys_write
-    mov rdi, 1          ; stdout
+    mov eax, SYS_write
+    mov edi, STDOUT
     mov rsi, usage_msg
-    mov rdx, 400        ; approximate length
+    mov edx, usage_len
+    syscall
+    xor edi, edi
+    mov eax, SYS_exit
     syscall
 
-    mov rax, 60         ; sys_exit
-    mov rdi, 0
+unknown_option:
+    mov rbx, out_buf
+    mov rsi, unknown_opt_msg
+    call emit_str
+    mov rsi, r10
+    call emit_str
+    mov rsi, use_help_msg
+    call emit_str
+
+    mov eax, SYS_write
+    mov edi, STDERR
+    mov rsi, out_buf
+    mov rdx, rbx
+    sub rdx, out_buf
     syscall
 
-main_program:
-    call read_battery_data
-    call display_info
-
-    mov rax, 60         ; sys_exit
-    mov rdi, 0
+    mov edi, 1
+    mov eax, SYS_exit
     syscall
 
-read_battery_data:
-    ; Ultra-fast batch file reading - completely inline
-    call read_all_battery_files_fast
-    ; Power calculation now inline in read_all_battery_files_fast
-    ret
-
-read_all_battery_files_fast:
-    ; Ultra-minimal file reading - inline everything, eliminate all calls
-    ; Capacity - completely inline
-    mov rax, 2
-    mov rdi, capacity_file
-    xor rsi, rsi
-    xor rdx, rdx
+no_battery:
+    mov eax, SYS_write
+    mov edi, STDOUT
+    mov rsi, no_battery_msg
+    mov edx, no_battery_len
     syscall
-    test eax, eax
-    js .skip_capacity
-    mov r8d, eax
-    xor eax, eax
-    mov edi, r8d
-    mov rsi, capacity_buf
-    mov edx, 15
-    syscall
-    mov byte [capacity_buf + rax], 0
-    mov eax, 3
-    mov edi, r8d
+    mov edi, 1
+    mov eax, SYS_exit
     syscall
 
-    ; Inline ASCII conversion for capacity
-    mov rdi, capacity_buf
-    xor rax, rax
-    xor rcx, rcx
-.cap_convert_loop:
-    mov cl, [rdi]
-    test cl, cl
-    jz .cap_done
-    cmp cl, 10
-    je .cap_done
-    sub cl, '0'
-    cmp cl, 9
-    ja .cap_done
-    lea rax, [rax + rax*4]
-    lea rax, [rcx + rax*2]
-    inc rdi
-    jmp .cap_convert_loop
-.cap_done:
-    mov [capacity], rax
+; ---------------------------------------------------------------------------
+; Battery discovery
+; ---------------------------------------------------------------------------
 
-.skip_capacity:
-    ; Current - inline everything
-    mov rax, 2
-    mov rdi, current_file
-    xor rsi, rsi
-    xor rdx, rdx
+; Collect every BAT* entry under /sys/class/power_supply into bat_names.
+; If there are none, fall back to the first entry that exposes a capacity file.
+scan_batteries:
+    mov qword [bat_count], 0
+    mov byte [fallback_name], 0
+
+    mov eax, SYS_open
+    mov rdi, supply_dir
+    mov esi, O_RDONLY_DIR
+    xor edx, edx
     syscall
     test eax, eax
-    js .skip_current
-    mov r8d, eax
-    xor eax, eax
-    mov edi, r8d
-    mov rsi, current_buf
-    mov edx, 15
-    syscall
-    mov byte [current_buf + rax], 0
-    mov eax, 3
-    mov edi, r8d
-    syscall
+    js .ret
+    mov [dirfd], rax
 
-    ; Inline ASCII conversion for current
-    mov rdi, current_buf
-    xor rax, rax
-    xor rcx, rcx
-.curr_convert_loop:
-    mov cl, [rdi]
-    test cl, cl
-    jz .curr_done
-    cmp cl, 10
-    je .curr_done
-    sub cl, '0'
-    cmp cl, 9
-    ja .curr_done
-    lea rax, [rax + rax*4]
-    lea rax, [rcx + rax*2]
-    inc rdi
-    jmp .curr_convert_loop
-.curr_done:
-    mov [current_now], rax
-
-.skip_current:
-    ; Voltage - inline everything
-    mov rax, 2
-    mov rdi, voltage_file
-    xor rsi, rsi
-    xor rdx, rdx
+.next_block:
+    mov eax, SYS_getdents64
+    mov rdi, [dirfd]
+    mov rsi, dirent_buf
+    mov edx, DENTS_SZ
     syscall
+    test rax, rax
+    jle .close
+    mov [dents_len], rax
+    mov qword [dents_off], 0
+
+.entry:
+    mov rax, [dents_off]
+    cmp rax, [dents_len]
+    jae .next_block
+
+    lea rsi, [dirent_buf + rax]
+    movzx edx, word [rsi + 16]      ; d_reclen
+    add [dents_off], rdx
+    lea rdi, [rsi + 19]             ; d_name
+    mov [cur_name], rdi
+
+    cmp byte [rdi], '.'
+    je .entry
+
+    cmp byte [rdi], 'B'
+    jne .try_fallback
+    cmp byte [rdi+1], 'A'
+    jne .try_fallback
+    cmp byte [rdi+2], 'T'
+    jne .try_fallback
+
+    call add_battery
+    jmp .entry
+
+.try_fallback:
+    cmp byte [fallback_name], 0
+    jne .entry
+
+    mov rdi, [cur_name]
+    call set_bat_path
+    mov rdi, a_capacity
+    call open_attr
     test eax, eax
-    js .skip_voltage
-    mov r8d, eax
-    xor eax, eax
-    mov edi, r8d
-    mov rsi, voltage_buf
-    mov edx, 15
-    syscall
-    mov byte [voltage_buf + rax], 0
-    mov eax, 3
-    mov edi, r8d
+    js .entry
+    mov edi, eax
+    mov eax, SYS_close
     syscall
 
-    ; Inline ASCII conversion for voltage
-    mov rdi, voltage_buf
-    xor rax, rax
-    xor rcx, rcx
-.volt_convert_loop:
-    mov cl, [rdi]
-    test cl, cl
-    jz .volt_done
-    cmp cl, 10
-    je .volt_done
-    sub cl, '0'
-    cmp cl, 9
-    ja .volt_done
-    lea rax, [rax + rax*4]
-    lea rax, [rcx + rax*2]
-    inc rdi
-    jmp .volt_convert_loop
-.volt_done:
-    mov [voltage_now], rax
+    mov rdi, fallback_name
+    mov rsi, [cur_name]
+    call copy_name
+    jmp .entry
 
-.skip_voltage:
-    ; Skip charge files for minimal version - not essential for basic display
-    ; Just set dummy values
-    mov qword [charge_now], 1
-    mov qword [charge_full], 1
-
-    ; Inline power calculation - correct unit conversion
-    ; current_now (microamps) × voltage_now (microvolts) = picowatts
-    ; Need to divide by 1,000,000,000,000 to get watts
-    ; But that's too big for one operation, so divide by 1,000,000 twice
-    mov rax, [current_now]
-    mov rbx, [voltage_now]
-    mul rbx             ; rax = picowatts
-
-    ; First division by 1,000,000
-    mov rcx, 1000000
-    xor rdx, rdx
-    div rcx
-
-    ; Second division by 1,000,000 to get watts
-    ; But we want to store in microwatts for display compatibility
-    ; So multiply by 1,000,000 after second division
-    ; Actually, let's just do one division to get microwatts
-    mov [power_now], rax
-
-    ; Skip status for minimal version - just assume discharging
-    ret
-
-calculate_power_fast:
-    ; Optimized power calculation with bit operations where possible
-    mov rax, [current_now]
-    mov rbx, [voltage_now]
-    mul rbx
-
-    ; Fast division by 1000000 using shift approximation
-    ; 1000000 ≈ 2^20 (1048576), so we can shift by 20 for approximation
-    ; But let's use exact division for accuracy
-    mov rcx, 1000000
-    xor rdx, rdx
-    div rcx
-    mov [power_now], rax
-    ret
-
-ascii_to_number_fast:
-    ; Ultra-optimized number conversion
-    xor rax, rax
-    xor rcx, rcx
-
-.convert_loop:
-    mov cl, [rdi]
-    test cl, cl
-    jz .done
-    sub cl, '0'
-    cmp cl, 9
-    ja .done
-    lea rax, [rax + rax*4]  ; rax *= 5
-    lea rax, [rcx + rax*2]  ; rax = digit + rax*2 (total: rax*10 + digit)
-    inc rdi
-    jmp .convert_loop
-
-.done:
-    ret
-
-read_number_from_file:
-    ; Input: rdi = filename
-    ; Output: rax = number (0 if error)
-    ; Optimized register usage
-
-    ; Open file
-    mov rax, 2          ; sys_open
-    xor rsi, rsi        ; O_RDONLY (use xor for zero)
-    xor rdx, rdx        ; mode
+.close:
+    mov eax, SYS_close
+    mov rdi, [dirfd]
     syscall
 
-    test eax, eax       ; Use 32-bit test (faster)
-    js read_error
-
-    mov r8d, eax        ; Save file descriptor (32-bit)
-
-    ; Read file
-    xor eax, eax        ; sys_read (use xor)
-    mov edi, r8d        ; Use 32-bit registers
-    mov rsi, file_buffer
-    mov edx, 64         ; Smaller buffer, numbers are short
-    syscall
-
-    ; Close file immediately
-    mov r9d, eax        ; Save bytes read in r9d
-    mov eax, 3          ; sys_close
-    mov edi, r8d
-    syscall
-
-    ; Process the result
-    test r9d, r9d
-    jle read_error
-
-    ; Null terminate
-    mov byte [file_buffer + r9], 0
-
-    ; Convert to number
-    mov rdi, file_buffer
-    call ascii_to_number
+    cmp qword [bat_count], 0
+    jne .ret
+    cmp byte [fallback_name], 0
+    je .ret
+    mov rdi, bat_names
+    mov rsi, fallback_name
+    call copy_name
+    mov qword [bat_count], 1
+.ret:
     ret
 
-read_error:
-    xor eax, eax        ; Return 0 on error (32-bit)
+; Append [cur_name] to the battery list
+add_battery:
+    mov rax, [bat_count]
+    cmp rax, MAX_BATS
+    jae .ret
+    mov rcx, NAME_MAX
+    mul rcx
+    lea rdi, [bat_names + rax]
+    mov rsi, [cur_name]
+    call copy_name
+    inc qword [bat_count]
+.ret:
     ret
 
-read_string_from_file:
-    ; Input: rdi = filename
-    ; Reads string into status_str buffer
-
-    ; Open file
-    mov rax, 2          ; sys_open
-    mov rsi, 0          ; O_RDONLY
-    mov rdx, 0          ; mode (not used for reading)
-    syscall
-
-    test rax, rax
-    js string_read_error ; Jump if negative (error)
-
-    mov r8, rax         ; Save file descriptor
-
-    ; Read file
-    mov rax, 0          ; sys_read
-    mov rdi, r8
-    mov rsi, status_str
-    mov rdx, 31
-    syscall
-
-    ; Close file
-    push rax            ; Save bytes read
-    mov rax, 3          ; sys_close
-    mov rdi, r8
-    syscall
-    pop rcx             ; Restore bytes read
-
-    ; Null terminate and remove newline
-    cmp rcx, 0
-    jle string_read_error
-    dec rcx             ; Remove newline
-    mov byte [status_str + rcx], 0
-
-    ret
-
-string_read_error:
-    mov byte [status_str], 0  ; Empty string on error
-    ret
-
-ascii_to_number:
-    ; Input: rdi = null-terminated string
-    ; Output: rax = number
-    ; Optimized with LEA instruction for faster multiplication
-    xor rax, rax        ; result = 0
-    xor rcx, rcx        ; temp for digit
-
-convert_loop:
-    mov cl, [rdi]       ; Get next character
-    test cl, cl         ; Check for null terminator
-    jz convert_done
-
-    ; Convert and validate digit in one step
-    sub cl, '0'
-    cmp cl, 9
-    ja convert_done
-
-    ; Optimized multiplication: result = result * 10 + digit
-    ; Using LEA: rax*10 = rax*8 + rax*2 = (rax<<3) + (rax<<1)
-    lea rax, [rax + rax*4]  ; rax *= 5
-    lea rax, [rcx + rax*2]  ; rax = digit + rax*2 (total: rax*10 + digit)
-
-    inc rdi
-    jmp convert_loop
-
-convert_done:
-    ret
-
-display_info:
-    cmp byte [show_all], 1
-    je display_all_info
-
-    cmp byte [show_percentage], 1
-    je display_percentage_only
-
-    cmp byte [show_watts], 1
-    je display_watts_only
-
-    cmp byte [show_time], 1
-    je display_time_only
-
-    cmp byte [show_amps], 1
-    je display_amps_only
-
-    ; Default: show all
-    jmp display_all_info
-
-display_all_info:
-    ; Ultra-minimal display - build entire output inline, single syscall
-    mov rdi, temp_buffer
-
-    ; BAT1 [
-    mov byte [rdi], 'B'
-    mov byte [rdi+1], 'A'
-    mov byte [rdi+2], 'T'
-    mov byte [rdi+3], '1'
-    mov byte [rdi+4], ' '
-    mov byte [rdi+5], '['
-    add rdi, 6
-
-    ; Progress bars inline
-    mov rax, [capacity]
-    mov rcx, 5
-    xor rdx, rdx
-    div rcx             ; filled bars
-    cmp rax, 20
-    jle .bars_ok
-    mov rax, 20
-.bars_ok:
-    push rax            ; Save filled count
-    mov rcx, rax
-    mov al, '#'
-.fill_loop:
-    test rcx, rcx
-    jz .add_empty
+; rdi = dst, rsi = src, truncated to NAME_MAX
+copy_name:
+    mov ecx, NAME_MAX - 1
+.copy:
+    mov al, [rsi]
     mov [rdi], al
-    inc rdi
-    dec rcx
-    jmp .fill_loop
-
-.add_empty:
-    pop rax
-    mov rcx, 20
-    sub rcx, rax
-    mov al, '-'
-.empty_loop:
-    test rcx, rcx
-    jz .close_bar
-    mov [rdi], al
-    inc rdi
-    dec rcx
-    jmp .empty_loop
-
-.close_bar:
-    mov word [rdi], '] '
-    add rdi, 2
-    mov byte [rdi], ' '
-    inc rdi
-
-    ; Inline percentage
-    mov rax, [capacity]
-    call itoa_minimal_inline
-    mov byte [rdi], '%'
-    inc rdi
-    mov word [rdi], ' -'
-    add rdi, 2
-    mov byte [rdi], ' '
-    inc rdi
-
-    ; Inline watts - exact copy of working display_watts logic
-    mov rax, [power_now]    ; power_now is in microwatts
-    mov rcx, 1000000
-    xor rdx, rdx
-    div rcx                 ; rax = watts integer, rdx = remainder
-    push rdx                ; Save remainder
-    call itoa_minimal_inline
-    mov byte [rdi], '.'
-    inc rdi
-
-    ; Decimal part (2 digits like original)
-    pop rax                 ; Get remainder
-    mov rcx, 10000          ; For 2 decimal places
-    xor rdx, rdx
-    div rcx
-
-    ; Handle leading zero for decimal
-    cmp rax, 10
-    jae .no_leading_zero_watts
-    push rax
-    mov byte [rdi], '0'
-    inc rdi
-    pop rax
-.no_leading_zero_watts:
-    call itoa_minimal_inline
-
-    mov byte [rdi], 'W'
-    inc rdi
-    mov byte [rdi], ' '
-    inc rdi
-
-    ; Inline amps with decimal
-    mov rax, [current_now]
-    mov rcx, 1000000
-    xor rdx, rdx
-    div rcx             ; rax = integer amps, rdx = remainder
-    push rdx            ; Save remainder
-    call itoa_minimal_inline
-    mov byte [rdi], '.'
-    inc rdi
-
-    ; Decimal part for amps
-    pop rax             ; Get remainder
-    mov rcx, 100000     ; For first decimal digit
-    xor rdx, rdx
-    div rcx
-    add al, '0'
-    mov [rdi], al
-    inc rdi
-
-    mov byte [rdi], 'A'
-    inc rdi
-    mov byte [rdi], ' '
-    inc rdi
-
-    ; Skip time for minimal version
-    mov byte [rdi], 10      ; newline
-    inc rdi
-
-    ; Single syscall output
-    mov rax, 1
-    mov rdx, 1              ; stdout
-    mov rsi, temp_buffer
-    mov rcx, rdi
-    sub rcx, temp_buffer    ; length
-    mov rdx, rcx
-    mov rdi, 1
-    syscall
-    ret
-
-itoa_minimal_inline:
-    ; Minimal itoa - inline everything
-    test rax, rax
-    jnz .not_zero
-    mov byte [rdi], '0'
-    inc rdi
-    ret
-.not_zero:
-    push rbx
-    push rcx
-    mov rbx, rdi
-    add rbx, 15
-    mov byte [rbx], 0
-    dec rbx
-    mov rcx, 10
-.digit_loop:
-    xor rdx, rdx
-    div rcx
-    add dl, '0'
-    mov [rbx], dl
-    dec rbx
-    test rax, rax
-    jnz .digit_loop
-    inc rbx
-.copy_loop:
-    mov al, [rbx]
     test al, al
     jz .done
-    mov [rdi], al
     inc rdi
-    inc rbx
-    jmp .copy_loop
+    inc rsi
+    dec ecx
+    jnz .copy
+    mov byte [rdi], 0
 .done:
-    pop rcx
-    pop rbx
     ret
 
-display_percentage_only:
-    call display_percentage
-    call print_newline
+; rdi = battery name -> path_buf = "/sys/class/power_supply/<name>/"
+set_bat_path:
+    push rdi
+    mov rdi, path_buf
+    mov rsi, supply_dir
+    call strcpy_z
+    pop rsi
+    call strcpy_z
+    mov byte [rdi], '/'
+    inc rdi
+    mov byte [rdi], 0
+    sub rdi, path_buf
+    mov [bat_path_len], rdi
     ret
 
-display_watts_only:
-    call display_watts
-    call print_newline
+; ---------------------------------------------------------------------------
+; sysfs attribute reads
+; ---------------------------------------------------------------------------
+
+; rdi = attribute name -> rax = fd (negative on error)
+open_attr:
+    mov rsi, rdi
+    mov rdi, path_buf
+    add rdi, [bat_path_len]
+    call strcpy_z
+
+    mov eax, SYS_open
+    mov rdi, path_buf
+    xor esi, esi                ; O_RDONLY
+    xor edx, edx
+    syscall
     ret
 
-display_time_only:
-    call display_time_remaining
-    call print_newline
+; rdi = attribute name -> rax = value, rdx = 1 if the file exists
+read_attr_num:
+    call open_attr
+    test eax, eax
+    js .missing
+
+    mov r8d, eax
+    xor eax, eax                ; SYS_read
+    mov edi, r8d
+    mov rsi, num_buf
+    mov edx, 31
+    syscall
+    mov r9, rax
+
+    mov eax, SYS_close
+    mov edi, r8d
+    syscall
+
+    test r9, r9
+    jle .missing
+    mov byte [num_buf + r9], 0
+
+    mov rdi, num_buf
+    call atou
+    mov edx, 1
+    ret
+.missing:
+    xor eax, eax
+    xor edx, edx
     ret
 
-display_amps_only:
-    call display_amps
-    call print_newline
-    ret
+; Read the status file into status_str and classify it
+read_status:
+    mov qword [status_code], ST_UNKNOWN
+    mov byte [status_str], 0
 
-display_progress_bar:
-    ; Print opening bracket
-    mov rsi, bracket_open
-    call print_string
+    mov rdi, a_status
+    call open_attr
+    test eax, eax
+    js .ret
 
-    ; Get battery color based on capacity
-    mov rdi, [capacity]
-    call get_battery_color
-    mov rsi, rax
-    call print_string
+    mov r8d, eax
+    xor eax, eax                ; SYS_read
+    mov edi, r8d
+    mov rsi, status_str
+    mov edx, NAME_MAX - 1
+    syscall
+    mov r9, rax
 
-    ; Calculate filled bars (capacity * 20 / 100) - optimized
-    ; Since 20/100 = 1/5, we can just divide by 5
-    mov rax, [capacity]
-    cmp rax, 100        ; Cap at 100%
-    jle capacity_ok
-    mov rax, 100
-capacity_ok:
-    ; Optimized: capacity * 20 / 100 = capacity / 5
-    mov rbx, 5
-    xor rdx, rdx
-    div rbx             ; rax = filled bars (much faster than mul+div)
+    mov eax, SYS_close
+    mov edi, r8d
+    syscall
 
-    ; Cap at 20 to be absolutely sure
-    cmp rax, 20
-    jle bars_ok
-    mov rax, 20
-bars_ok:
-    mov [filled_count], rax     ; Save filled count in memory
+    test r9, r9
+    jle .ret
+    mov byte [status_str + r9], 0
 
-    ; Calculate empty bars (20 - filled)
-    mov rbx, 20
-    sub rbx, rax                ; rbx = 20 - filled
-    mov [empty_count], rbx      ; Save empty count in memory
+    ; Trim the trailing newline (and any other control characters)
+.trim:
+    test r9, r9
+    jz .classify
+    dec r9
+    cmp byte [status_str + r9], ' '
+    ja .classify
+    mov byte [status_str + r9], 0
+    jmp .trim
 
-    ; Print filled bars - simple counter approach
-    mov rcx, 0                  ; Start counter at 0
-print_filled_loop:
-    cmp rcx, [filled_count]     ; Compare counter with filled count
-    jae print_empty_start
-
-    push rcx                    ; Save counter before function call
-    mov rsi, hash_char
-    call print_string
-    pop rcx                     ; Restore counter after function call
-    inc rcx
-    jmp print_filled_loop
-
-print_empty_start:
-    ; Reset color
-    mov rsi, reset_color
-    call print_string
-
-    ; Print empty bars - simple counter approach
-    mov rcx, 0                  ; Start counter at 0
-print_empty_loop:
-    cmp rcx, [empty_count]      ; Compare counter with empty count
-    jae close_progress_bar
-
-    push rcx                    ; Save counter before function call
-    mov rsi, dash_char
-    call print_string
-    pop rcx                     ; Restore counter after function call
-    inc rcx
-    jmp print_empty_loop
-
-close_progress_bar:
-    mov rsi, bracket_close
-    call print_string
-    ret
-
-display_percentage:
-    ; Get color
-    mov rdi, [capacity]
-    call get_battery_color
-    mov rsi, rax
-    call print_string
-
-    ; Print number
-    mov rdi, [capacity]
-    call print_number
-
-    ; Print % symbol
-    mov rsi, percent_char
-    call print_string
-
-    ; Reset color
-    mov rsi, reset_color
-    call print_string
-    ret
-
-display_status_symbol:
-    ; Determine status symbol based on status_str
+.classify:
     mov rdi, status_str
     mov rsi, charging_str
-    call string_compare
-    test rax, rax
-    jz show_charging_symbol
+    call str_eq
+    test al, al
+    jnz .charging
 
     mov rdi, status_str
     mov rsi, discharging_str
-    call string_compare
-    test rax, rax
-    jz show_discharging_symbol
+    call str_eq
+    test al, al
+    jnz .discharging
 
     mov rdi, status_str
     mov rsi, full_str
-    call string_compare
-    test rax, rax
-    jz show_full_symbol
-
-    ; Unknown status
-    mov rsi, unknown_symbol
-    call print_string
+    call str_eq
+    test al, al
+    jz .ret
+    mov qword [status_code], ST_FULL
+    ret
+.charging:
+    mov qword [status_code], ST_CHARGING
+    ret
+.discharging:
+    mov qword [status_code], ST_DISCHARGING
+.ret:
     ret
 
-show_charging_symbol:
-    mov rsi, charging_symbol
-    call print_string
-    ret
+; Read every metric for the battery currently in path_buf
+read_battery:
+    mov rdi, a_capacity
+    call read_attr_num
+    mov [capacity], rax
 
-show_discharging_symbol:
-    mov rsi, discharging_symbol
-    call print_string
-    ret
+    call read_status
 
-show_full_symbol:
-    mov rsi, full_symbol
-    call print_string
-    ret
+    mov rdi, a_current
+    call read_attr_num
+    mov [current_now], rax
 
-display_watts:
-    ; Optimized watts display using existing print_number
-    mov rax, [power_now]
-    mov rcx, 1000000
-    xor rdx, rdx
-    div rcx             ; rax = watts integer part
+    mov rdi, a_voltage
+    call read_attr_num
+    mov [voltage_now], rax
 
-    push rdx            ; Save remainder for decimal part
+    mov rdi, a_power
+    call read_attr_num
+    mov [power_now], rax
 
-    ; Print integer part
-    mov rdi, rax
-    call print_number
+    ; Energy-reporting batteries expose energy_*, charge-reporting ones charge_*
+    mov rdi, a_energy_now
+    call read_attr_num
+    mov [energy_based], rdx
+    test rdx, rdx
+    jnz .have_now
+    mov rdi, a_charge_now
+    call read_attr_num
+.have_now:
+    mov [energy_now], rax
 
-    ; Print decimal point
-    mov rsi, dot_char
-    call print_string_ultra_fast
+    cmp qword [energy_based], 0
+    je .charge_full
+    mov rdi, a_energy_full
+    call read_attr_num
+    jmp .have_full
+.charge_full:
+    mov rdi, a_charge_full
+    call read_attr_num
+.have_full:
+    mov [energy_full], rax
 
-    ; Calculate and print decimal part (2 digits)
-    pop rax             ; Get remainder
-    mov rcx, 10000
-    xor rdx, rdx
-    div rcx             ; rax = first two decimal digits
-
-    ; Print with leading zero if needed
-    cmp rax, 10
-    jae print_watts_decimal
-
-    ; Print leading zero
-    mov rdi, 0
-    call print_number
-
-print_watts_decimal:
-    mov rdi, rax
-    call print_number
-
-    ; Print W
-    mov rsi, w_char
-    call print_string_ultra_fast
-    ret
-
-display_amps:
-    ; Optimized amps display
+    ; No power_now: derive it, µA * µV / 1e6 = µW
+    cmp qword [power_now], 0
+    jne .amps
     mov rax, [current_now]
+    test rax, rax
+    jz .amps
+    mov rcx, [voltage_now]
+    test rcx, rcx
+    jz .amps
+    mul rcx
     mov rcx, 1000000
-    xor rdx, rdx
-    div rcx             ; rax = amps integer part
+    div rcx
+    mov [power_now], rax
 
-    push rdx            ; Save remainder for decimal part
+.amps:
+    ; No current_now: derive it, µW * 1e6 / µV = µA
+    cmp qword [current_now], 0
+    jne calc_time
+    mov rax, [power_now]
+    test rax, rax
+    jz calc_time
+    mov rcx, [voltage_now]
+    test rcx, rcx
+    jz calc_time
+    mov rsi, 1000000
+    mul rsi
+    div rcx
+    mov [current_now], rax
+    ; fall through
 
-    ; Print integer part
-    mov rdi, rax
-    call print_number
+; Minutes until full (charging) or empty (discharging)
+calc_time:
+    mov qword [time_mins], 0
 
-    ; Print decimal point
-    mov rsi, dot_char
-    call print_string_ultra_fast
+    mov rcx, [current_now]
+    cmp qword [energy_based], 0
+    je .have_rate
+    mov rcx, [power_now]
+.have_rate:
+    mov [rate], rcx
 
-    ; Calculate and print decimal part (2 digits)
-    pop rax             ; Get remainder
-    mov rcx, 10000
-    xor rdx, rdx
-    div rcx             ; rax = first two decimal digits
-
-    ; Print with leading zero if needed
-    cmp rax, 10
-    jae print_amps_decimal
-
-    ; Print leading zero
-    mov rdi, 0
-    call print_number
-
-print_amps_decimal:
-    mov rdi, rax
-    call print_number
-
-    ; Print A
-    mov rsi, a_char
-    call print_string_ultra_fast
+    cmp qword [status_code], ST_CHARGING
+    je .charging
+    cmp qword [status_code], ST_DISCHARGING
+    je .discharging
     ret
 
-display_time_remaining:
-    ; Calculate time remaining based on status
-    mov rdi, status_str
-    mov rsi, charging_str
-    call string_compare
+.charging:
+    mov rax, [energy_full]
+    sub rax, [energy_now]
+    jbe .ret
+    jmp .compute
+.discharging:
+    mov rax, [energy_now]
     test rax, rax
-    jz calc_charging_time
-
-    mov rdi, status_str
-    mov rsi, discharging_str
-    call string_compare
-    test rax, rax
-    jz calc_discharging_time
-
-    ; Full or unknown status - no time display
+    jz .ret
+.compute:
+    mov rcx, [rate]
+    cmp rcx, 1000
+    jbe .ret
+    mov rsi, 60
+    mul rsi
+    div rcx
+    mov [time_mins], rax
+.ret:
     ret
 
-calc_charging_time:
-    ; Time until full = (charge_full - charge_now) * 60 / current_now
-    mov rax, [charge_full]
-    sub rax, [charge_now]
-    mov rbx, 60
-    mul rbx
-    mov rbx, [current_now]
-    test rbx, rbx
-    jz no_time_display
-    xor rdx, rdx
-    div rbx
+; ---------------------------------------------------------------------------
+; Output
+; ---------------------------------------------------------------------------
 
-    ; Display "Full in HH:MM"
+; Colors only make sense on a terminal
+detect_tty:
+    mov eax, SYS_ioctl
+    mov edi, STDOUT
+    mov esi, TCGETS
+    mov rdx, termios_buf
+    syscall
+    test eax, eax
+    jnz .ret
+    mov byte [use_color], 1
+.ret:
+    ret
+
+; Build the output for the current battery and write it in one syscall
+render:
+    mov rbx, out_buf
+
+    cmp byte [show_all], 1
+    je .all
+
+    cmp byte [show_percentage], 1
+    jne .no_pct
+    call emit_percentage
+    call emit_nl
+.no_pct:
+    cmp byte [show_watts], 1
+    jne .no_watts
+    call emit_watts
+    call emit_nl
+.no_watts:
+    cmp byte [show_amps], 1
+    jne .no_amps
+    call emit_amps
+    call emit_nl
+.no_amps:
+    cmp byte [show_time], 1
+    jne .flush
+    cmp qword [status_code], ST_CHARGING
+    je .time
+    cmp qword [status_code], ST_DISCHARGING
+    jne .flush
+.time:
+    call emit_time
+    call emit_nl
+    jmp .flush
+
+.all:
+    ; BAT1 [####----------------]  50% - 5.23W 0.78A Left 02:30
+    mov rax, NAME_MAX
+    mul r15
+    lea rsi, [bat_names + rax]
+    call emit_str
+    mov al, ' '
+    call emit_char
+
+    call emit_bar
+    mov al, ' '
+    call emit_char
+
+    call emit_percentage
+    mov al, ' '
+    call emit_char
+
+    call emit_status_symbol
+    mov al, ' '
+    call emit_char
+
+    call emit_watts
+    mov al, ' '
+    call emit_char
+
+    call emit_amps
+
+    cmp qword [status_code], ST_CHARGING
+    je .all_time
+    cmp qword [status_code], ST_DISCHARGING
+    jne .all_end
+.all_time:
+    mov al, ' '
+    call emit_char
+    call emit_time
+.all_end:
+    call emit_nl
+
+.flush:
+    mov rdx, rbx
+    sub rdx, out_buf
+    jz .ret
+    mov eax, SYS_write
+    mov edi, STDOUT
+    mov rsi, out_buf
+    syscall
+.ret:
+    ret
+
+emit_bar:
+    mov al, '['
+    call emit_char
+
+    mov rdi, [capacity]
+    call battery_color
+    mov rsi, rax
+    call emit_color
+
+    ; filled = capacity * BAR_WIDTH / 100, capped at BAR_WIDTH
+    mov rax, [capacity]
+    cmp rax, 100
+    jbe .capped
+    mov eax, 100
+.capped:
+    mov rcx, 100 / BAR_WIDTH
+    xor edx, edx
+    div rcx
+    mov r8, rax                 ; filled
+    mov rcx, rax
+
+    mov al, '#'
+.fill:
+    test rcx, rcx
+    jz .empty
+    call emit_char
+    dec rcx
+    jmp .fill
+
+.empty:
+    mov rsi, reset_color
+    call emit_color
+
+    mov rcx, BAR_WIDTH
+    sub rcx, r8                 ; empty
+
+    mov al, '-'
+.dash:
+    test rcx, rcx
+    jz .close
+    call emit_char
+    dec rcx
+    jmp .dash
+
+.close:
+    mov al, ']'
+    call emit_char
+    ret
+
+emit_percentage:
+    mov rdi, [capacity]
+    call battery_color
+    mov rsi, rax
+    call emit_color
+
+    mov rax, [capacity]
+    call emit_num_pad3
+    mov al, '%'
+    call emit_char
+
+    mov rsi, reset_color
+    call emit_color
+    ret
+
+emit_status_symbol:
+    cmp qword [status_code], ST_CHARGING
+    je .charging
+    cmp qword [status_code], ST_DISCHARGING
+    je .discharging
+    cmp qword [status_code], ST_FULL
+    je .full
+
+    mov rsi, yellow_color
+    call emit_color
+    mov al, '?'
+    jmp .emit
+.charging:
+    mov rsi, blue_color
+    call emit_color
+    mov al, '+'
+    jmp .emit
+.discharging:
+    mov rdi, [capacity]
+    call battery_color
+    mov rsi, rax
+    call emit_color
+    mov al, '-'
+    jmp .emit
+.full:
+    mov rsi, green_color
+    call emit_color
+    mov al, '='
+.emit:
+    call emit_char
+    mov rsi, reset_color
+    call emit_color
+    ret
+
+emit_watts:
+    mov rax, [power_now]
+    call emit_micro
+    mov al, 'W'
+    call emit_char
+    ret
+
+emit_amps:
+    mov rax, [current_now]
+    call emit_micro
+    mov al, 'A'
+    call emit_char
+    ret
+
+emit_time:
+    cmp qword [status_code], ST_CHARGING
+    jne .left
     mov rsi, full_in_str
-    call print_string
-    mov rdi, rax
-    call display_time_format
-    ret
-
-calc_discharging_time:
-    ; Time until empty = charge_now * 60 / current_now
-    mov rax, [charge_now]
-    mov rbx, 60
-    mul rbx
-    mov rbx, [current_now]
-    test rbx, rbx
-    jz no_time_display
-    xor rdx, rdx
-    div rbx
-
-    ; Display time format
-    mov rdi, rax
-    call display_time_format
-    call print_space
+    jmp .prefix
+.left:
     mov rsi, left_str
-    call print_string
-    ret
+.prefix:
+    call emit_str
+    mov al, ' '
+    call emit_char
 
-no_time_display:
-    ret
-
-display_time_format:
-    ; Input: rdi = minutes
-    ; Output: HH:MM format
-    mov rax, rdi
-    mov rbx, 60
-    xor rdx, rdx
-    div rbx         ; rax = hours, rdx = minutes
-
-    ; Print hours (2 digits)
-    push rdx        ; Save minutes
-    mov rdi, rax
-    cmp rdi, 10
-    jge print_hours
-    mov rdi, 0
-    call print_number
-    pop rdx
+    mov rax, [time_mins]
+    test rax, rax
+    jnz .hhmm
+    mov rsi, no_time_str
+    jmp emit_str
+.hhmm:
+    mov rcx, 60
+    xor edx, edx
+    div rcx                     ; rax = hours, rdx = minutes
     push rdx
-    mov rdi, rax
-
-print_hours:
-    call print_number
-
-    ; Print colon
-    mov rsi, colon_str
-    call print_string
-
-    ; Print minutes (2 digits)
-    pop rdi         ; Restore minutes
-    cmp rdi, 10
-    jge print_minutes
-    push rdi
-    mov rdi, 0
-    call print_number
-    pop rdi
-
-print_minutes:
-    call print_number
+    call emit_num_pad2
+    mov al, ':'
+    call emit_char
+    pop rax
+    call emit_num_pad2
     ret
 
-get_battery_color:
-    ; Input: rdi = percentage
-    ; Output: rax = color string address
-    cmp rdi, 10
-    jle return_red
-    cmp rdi, 25
-    jle return_yellow
-    mov rax, green_color
-    ret
-
-return_red:
+; rdi = percentage -> rax = color string
+battery_color:
     mov rax, red_color
-    ret
-
-return_yellow:
+    cmp rdi, 10
+    jbe .ret
     mov rax, yellow_color
+    cmp rdi, 25
+    jbe .ret
+    mov rax, green_color
+.ret:
     ret
 
-print_number:
-    ; Input: rdi = number to print
-    ; Uses temp_buffer to build string
+; rax = value in micro-units -> "N.NN"
+emit_micro:
+    mov rcx, 1000000
+    xor edx, edx
+    div rcx
+    push rdx
+    call emit_num
+    mov al, '.'
+    call emit_char
+    pop rax
+    mov rcx, 10000
+    xor edx, edx
+    div rcx
+    call emit_num_pad2
+    ret
 
-    push rbx
+; ---------------------------------------------------------------------------
+; Emit primitives - rbx is the output cursor, everything else is preserved
+; ---------------------------------------------------------------------------
+
+; al = character
+emit_char:
+    mov [rbx], al
+    inc rbx
+    ret
+
+emit_nl:
+    push rax
+    mov al, 10
+    call emit_char
+    pop rax
+    ret
+
+; rsi = null-terminated string
+emit_str:
+    push rax
+    push rsi
+.loop:
+    mov al, [rsi]
+    test al, al
+    jz .done
+    mov [rbx], al
+    inc rbx
+    inc rsi
+    jmp .loop
+.done:
+    pop rsi
+    pop rax
+    ret
+
+; rsi = null-terminated string, emitted only when stdout is a terminal
+emit_color:
+    cmp byte [use_color], 0
+    je .ret
+    jmp emit_str
+.ret:
+    ret
+
+; rax = value
+emit_num:
+    push rax
     push rcx
     push rdx
+    push rsi
 
-    mov rax, rdi
-    mov rsi, temp_buffer + 63  ; Point to end of buffer
-    mov byte [rsi], 0          ; Null terminate
+    mov rsi, num_tmp + 31
+    mov byte [rsi], 0
+    mov rcx, 10
+.digit:
+    xor edx, edx
+    div rcx
+    add dl, '0'
     dec rsi
-
-    mov rbx, 10
-
-number_to_string_loop:
-    xor rdx, rdx
-    div rbx                    ; rax = quotient, rdx = remainder
-    add dl, '0'                ; Convert digit to ASCII
     mov [rsi], dl
-    dec rsi
     test rax, rax
-    jnz number_to_string_loop
+    jnz .digit
+    call emit_str
 
-    inc rsi                    ; Point to first digit
-    call print_string
-
+    pop rsi
     pop rdx
     pop rcx
-    pop rbx
+    pop rax
     ret
 
-string_compare:
-    ; Input: rdi = str1, rsi = str2
-    ; Output: rax = 0 if equal, 1 if different
+; rax = value, padded with a leading zero below 10
+emit_num_pad2:
+    push rax
+    cmp rax, 10
+    jae .num
+    mov al, '0'
+    call emit_char
+.num:
+    pop rax
+    jmp emit_num
 
-compare_loop:
-    mov al, [rdi]
-    mov bl, [rsi]
-    cmp al, bl
-    jne strings_different
+; rax = value, right-aligned in three columns
+emit_num_pad3:
+    push rax
+    cmp rax, 100
+    jae .num
+    mov al, ' '
+    call emit_char
+    cmp qword [rsp], 10
+    jae .num
+    call emit_char
+.num:
+    pop rax
+    jmp emit_num
 
-    test al, al         ; Check for end of string
-    jz strings_equal
+; ---------------------------------------------------------------------------
+; String helpers
+; ---------------------------------------------------------------------------
 
+; rdi = dst, rsi = src -> rdi points at the terminating null
+strcpy_z:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .done
     inc rdi
     inc rsi
-    jmp compare_loop
-
-strings_equal:
-    xor rax, rax        ; Return 0 (equal)
+    jmp strcpy_z
+.done:
     ret
 
-strings_different:
-    mov rax, 1          ; Return 1 (different)
-    ret
-
-print_string_ultra_fast:
-    ; Ultra-fast string printing - inline length calculation
-    push rdi
-    push rdx
-    push rcx
-
-    mov rdi, rsi        ; String start
-    mov rcx, rsi        ; Also save start
-
-.length_loop:
-    cmp byte [rdi], 0
-    je .print_now
+; rdi = str1, rsi = str2 -> al = 1 when equal
+str_eq:
+    mov al, [rdi]
+    mov cl, [rsi]
+    cmp al, cl
+    jne .differ
+    test al, al
+    jz .equal
     inc rdi
-    jmp .length_loop
-
-.print_now:
-    sub rdi, rcx        ; Calculate length
-    mov rdx, rdi        ; Length
-    mov rsi, rcx        ; String start
-    mov rax, 1          ; sys_write
-    mov rdi, 1          ; stdout
-    syscall
-
-    pop rcx
-    pop rdx
-    pop rdi
+    inc rsi
+    jmp str_eq
+.equal:
+    mov eax, 1
+    ret
+.differ:
+    xor eax, eax
     ret
 
-print_string:
-    ; Fallback to ultra-fast version
-    jmp print_string_ultra_fast
-
-string_length:
-    ; Input: rdi = string
-    ; Output: rax = length
-    xor rax, rax
-
-length_loop:
-    cmp byte [rdi + rax], 0
-    je length_done
-    inc rax
-    jmp length_loop
-
-length_done:
-    ret
-
-print_space:
-    mov rsi, space_char
-    call print_string
-    ret
-
-print_newline:
-    mov rsi, newline
-    call print_string
+; rdi = null-terminated digits -> rax = value
+atou:
+    xor eax, eax
+    xor ecx, ecx
+.loop:
+    mov cl, [rdi]
+    sub cl, '0'
+    cmp cl, 9
+    ja .done
+    lea rax, [rax + rax*4]      ; rax *= 5
+    lea rax, [rcx + rax*2]      ; rax = rax*10 + digit
+    inc rdi
+    jmp .loop
+.done:
     ret
